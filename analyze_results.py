@@ -2,6 +2,12 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
+# Load metrics for decryption analysis
+try:
+    perf_df = pd.read_csv("metrics/perf_metrics.csv")
+except FileNotFoundError:
+    perf_df = None
+
 # Load overall results
 overall_df = pd.read_csv("metrics/model_overall_results.csv")
 
@@ -184,3 +190,44 @@ print(f"• {hardest_algo} is the HARDEST algorithm to classify")
 
 print(f"\n💡 RECOMMENDATION: Use {best_model} for production encryption algorithm classification")
 print("="*60)
+
+# -----------------------------
+# Decryption metrics analysis
+# -----------------------------
+if perf_df is not None and {
+    "algorithm","decrypt_elapsed_ms","decrypt_throughput_mb_s"
+}.issubset(perf_df.columns):
+    print("\n🕒 DECRYPTION METRICS ANALYSIS:")
+    print("-" * 40)
+
+    # Aggregate by algorithm across all sizes
+    dec_stats = perf_df.groupby("algorithm").agg(
+        avg_dec_ms = ("decrypt_elapsed_ms","mean"),
+        min_dec_ms = ("decrypt_elapsed_ms","min"),
+        max_dec_ms = ("decrypt_elapsed_ms","max"),
+        std_dec_ms = ("decrypt_elapsed_ms","std"),
+        avg_dec_thr = ("decrypt_throughput_mb_s","mean"),
+    ).reset_index()
+
+    # Exclude ASCON if its decryption metrics are zero by design here
+    dec_stats_nonzero = dec_stats[(dec_stats["avg_dec_ms"] > 0) | (dec_stats["avg_dec_thr"] > 0)]
+
+    print("\nFastest decryption (highest throughput):")
+    for _, r in dec_stats_nonzero.sort_values("avg_dec_thr", ascending=False).head(3).iterrows():
+        print(f"  ⚡ {r['algorithm']:10} | Avg Thr: {r['avg_dec_thr']:.3f} MB/s | Avg Time: {r['avg_dec_ms']:.2f} ms")
+
+    print("\nSlowest decryption (lowest throughput):")
+    for _, r in dec_stats_nonzero.sort_values("avg_dec_thr").head(3).iterrows():
+        print(f"  🐢 {r['algorithm']:10} | Avg Thr: {r['avg_dec_thr']:.3f} MB/s | Avg Time: {r['avg_dec_ms']:.2f} ms")
+
+    # Correlate decryption speed with classification difficulty (low F1)
+    if 'avg_f1' in pd.DataFrame(algorithm_difficulty).T.columns:
+        merged = dec_stats_nonzero.merge(
+            pd.DataFrame(algorithm_difficulty).T.reset_index().rename(columns={'index':'algorithm'}),
+            on='algorithm', how='left'
+        )
+        corr = merged['avg_dec_thr'].corr(merged['avg_f1'])
+        if pd.notna(corr):
+            print(f"\nCorrelation between decryption throughput and F1 (difficulty): {corr:+.3f}")
+else:
+    print("\n[INFO] Decryption metrics not found in metrics/perf_metrics.csv; skip decryption analysis.")

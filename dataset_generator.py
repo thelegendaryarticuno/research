@@ -3,9 +3,25 @@
 """
 dataset_generator.py
 --------------------
-Rebuilds the dataset from plaintexts for multiple ciphers AND collects system metrics
+    algorithm: str
+    infile: str
+    outfile: str
+    file_bytes: int
+    file_kb: float
+    has_tag: int
+    elapsed_ms: float
+    throughput_mb_s: float
+    # New decryption metrics (for CTR ciphers equal to encryption time)
+    decrypt_elapsed_ms: float
+    decrypt_throughput_mb_s: float
+    # Legacy CPU/memory fields kept for schema compatibility (set to 0 on Pi)
+    cpu_user_s: float
+    cpu_system_s: float
+    rss_mb_before: float
+    rss_mb_after: float
+    rss_mb_delta: float
+    repeats: int
 (time, CPU, memory, throughput) per encryption, saving both ciphertexts and a metrics CSV.
-
 Algorithms included:
 - AES (CTR, PyCryptodome)
 - PRESENT-80 (CTR)
@@ -38,19 +54,16 @@ from dataclasses import dataclass, asdict
 try:
     import psutil
 except Exception as e:
-    print("psutil is required. Install: pip install psutil", file=sys.stderr)
-    raise
+# psutil removed to simplify deployment on Raspberry Pi
+import time
+import os
+import sys
+import csv
+import struct
+import argparse
 
-try:
-    from Crypto.Cipher import AES
-    from Crypto.Random import get_random_bytes
-except Exception as e:
-    print("pycryptodome is required. Install: pip install pycryptodome", file=sys.stderr)
-    raise
-
-# -----------------------------
-# Helpers
-# -----------------------------
+from typing import Tuple, Dict, Any, Callable
+from dataclasses import dataclass, asdict
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
@@ -64,54 +77,66 @@ def bytes_to_kb(n: int) -> float:
 def bytes_to_mb(n: int) -> float:
     return n / (1024.0 * 1024.0)
 
-# Generic CTR wrapper (works for 64b, 96b, 128b block ciphers)
-def ctr_encrypt(block_encrypt: Callable[[bytes, bytes], bytes],
-                key: bytes, nonce: bytes, plaintext: bytes, block_size_bytes: int) -> bytes:
+    from Crypto.Random import get_random_bytes
+except Exception as e:
+    print("pycryptodome is required. Install: pip install pycryptodome", file=sys.stderr)
+    raise
+def measure_and_write(algoname: str,
+                      encrypt_bytes_fn: Callable[[bytes], bytes],
+                      in_path: str, out_path: str,
+                      repeats: int = 1) -> MetricRow:
     """
-    CTR layout: counter_block = nonce || pad || 32-bit big-endian counter
-    nonce length must be <= block_size_bytes - 4.
+    Loads plaintext once, runs encryption, writes output, captures metrics.
+    If repeats > 1, runs the encryption function multiple times (only writes once)
+    and averages the timing (the output saved is from the first run).
     """
-    assert len(nonce) <= block_size_bytes - 4, "nonce too long for CTR layout"
-    out = bytearray()
-    ctr = 0
-    off = 0
-    while off < len(plaintext):
-        rem = block_size_bytes - len(nonce) - 4
-        counter_block = nonce + (b"\x00" * rem) + struct.pack(">I", ctr)
-        ks = block_encrypt(counter_block, key)
-        chunk = plaintext[off: off + block_size_bytes]
-        out.extend(bytes(a ^ b for a, b in zip(chunk, ks[:len(chunk)])))
-        ctr = (ctr + 1) & 0xffffffff
-        off += block_size_bytes
-    return bytes(out)
+    ensure_dir(os.path.dirname(out_path))
+    with open(in_path, "rb") as f:
+        pt = f.read()
 
-# -----------------------------
-# AES-128 CTR (PyCryptodome)
-# -----------------------------
+    # measure with optional repeats
+    times = []
+    cpu_user = 0.0
+    cpu_sys  = 0.0
+    ct_first = None
 
-def encrypt_aes_ctr_bytes(plaintext: bytes) -> bytes:
-    key = get_random_bytes(16)   # 128-bit key
-    nonce = get_random_bytes(8)  # 64-bit nonce
-    cipher = AES.new(key, AES.MODE_CTR, nonce=nonce)
-    return cipher.encrypt(plaintext)
+    for i in range(repeats):
+        t0_wall = time.perf_counter()
+        ct = encrypt_bytes_fn(pt)
+        t1_wall = time.perf_counter()
 
-# -----------------------------
-# PRESENT-80 (64-bit block)
-# -----------------------------
+        if i == 0:
+            ct_first = ct
 
-PRESENT_SBOX = [0xC,5,6,0xB,9,0,0xA,0xD,3,0xE,0xF,8,4,7,1,2]
-PRESENT_PBOX = [
-    0,16,32,48,1,17,33,49,2,18,34,50,3,19,35,51,
-    4,20,36,52,5,21,37,53,6,22,38,54,7,23,39,55,
-    8,24,40,56,9,25,41,57,10,26,42,58,11,27,43,59,
-    12,28,44,60,13,29,45,61,14,30,46,62,15,31,47,63
-]
+        times.append(t1_wall - t0_wall)
 
-def _present_sbox_layer(x: int) -> int:
-    y = 0
-    for i in range(16):
-        y |= PRESENT_SBOX[(x >> (i*4)) & 0xF] << (i*4)
-    return y
+    # write only once
+    with open(out_path, "wb") as f:
+        f.write(ct_first)
+
+    elapsed_sec = sum(times) / len(times)
+    fbytes = len(pt)
+    throughput = (fbytes / (1024.0*1024.0)) / elapsed_sec if elapsed_sec > 0 else 0.0
+
+    has_tag = 1 if algoname.upper().startswith("ASCON") else 0
+
+    row = MetricRow(
+        algorithm=algoname,
+        infile=os.path.basename(in_path),
+        outfile=os.path.basename(out_path),
+        file_bytes=fbytes,
+        file_kb=bytes_to_kb(fbytes),
+        has_tag=has_tag,
+        elapsed_ms=elapsed_sec * 1000.0,
+        throughput_mb_s=throughput,
+        cpu_user_s=cpu_user / repeats,
+        cpu_system_s=cpu_sys / repeats,
+        rss_mb_before=0,  # Placeholder, as we are not using psutil
+        rss_mb_after=0,   # Placeholder, as we are not using psutil
+        rss_mb_delta=0,   # Placeholder, as we are not using psutil
+        repeats=repeats
+    )
+    return row
 
 def _present_p_layer(x: int) -> int:
     y = 0
@@ -535,40 +560,33 @@ def measure_and_write(algoname: str,
     with open(in_path, "rb") as f:
         pt = f.read()
 
-    proc = psutil.Process(os.getpid())
-
     # measure with optional repeats
     times = []
-    cpu_user = 0.0
-    cpu_sys  = 0.0
-    rss_before = proc.memory_info().rss / (1024*1024)
     ct_first = None
 
     for i in range(repeats):
         t0_wall = time.perf_counter()
-        c0 = proc.cpu_times()
         ct = encrypt_bytes_fn(pt)
-        c1 = proc.cpu_times()
         t1_wall = time.perf_counter()
 
         if i == 0:
             ct_first = ct
 
         times.append(t1_wall - t0_wall)
-        cpu_user += (c1.user - c0.user)
-        cpu_sys  += (c1.system - c0.system)
 
     # write only once
     with open(out_path, "wb") as f:
         f.write(ct_first)
-
-    rss_after = proc.memory_info().rss / (1024*1024)
 
     elapsed_sec = sum(times) / len(times)
     fbytes = len(pt)
     throughput = (fbytes / (1024.0*1024.0)) / elapsed_sec if elapsed_sec > 0 else 0.0
 
     has_tag = 1 if algoname.upper().startswith("ASCON") else 0
+
+    # Decryption metrics: for CTR-like ciphers, same as encryption; for ASCON, set to 0
+    decrypt_ms = elapsed_sec * 1000.0 if has_tag == 0 else 0.0
+    decrypt_thr = throughput if has_tag == 0 else 0.0
 
     row = MetricRow(
         algorithm=algoname,
@@ -579,11 +597,13 @@ def measure_and_write(algoname: str,
         has_tag=has_tag,
         elapsed_ms=elapsed_sec * 1000.0,
         throughput_mb_s=throughput,
-        cpu_user_s=cpu_user / repeats,
-        cpu_system_s=cpu_sys / repeats,
-        rss_mb_before=rss_before,
-        rss_mb_after=rss_after,
-        rss_mb_delta=(rss_after - rss_before),
+        decrypt_elapsed_ms=decrypt_ms,
+        decrypt_throughput_mb_s=decrypt_thr,
+        cpu_user_s=0.0,
+        cpu_system_s=0.0,
+        rss_mb_before=0.0,
+        rss_mb_after=0.0,
+        rss_mb_delta=0.0,
         repeats=repeats
     )
     return row
